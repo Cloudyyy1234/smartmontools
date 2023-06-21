@@ -157,6 +157,12 @@ static unsigned char debugmode = 0;
 static constexpr int default_checktime = 1800;
 static int checktime = default_checktime;
 static int checktime_min = 0; // Minimum individual check time, 0 if none
+// Default relative ratio of the infomal temperature to the critical 
+// temperature. This is a recommended value.
+const double default_temperature_level_ratio = 0.8;
+// The deviation between the set value and the value defined by the 
+// manufacturer cannot exceed 10 degree Celsius. This is a recommended value.
+const unsigned char max_deviation_temp = 10;
 
 // command-line: name of PID file (empty for no pid file)
 static std::string pid_file;
@@ -1945,6 +1951,44 @@ static bool is_duplicate_dev_idinfo(const dev_config & cfg, const dev_config_vec
   return false;
 }
 
+static void CheckTemperatureConfig(const unsigned char recommend_threshold, const char *temp_level,
+                                   const char *device_name, unsigned char &config_threshold)
+{
+  if (!config_threshold) {
+    // If the temperature threshold is not configured, set this parameter to the recommended value.
+    config_threshold = recommend_threshold;
+    return;
+  }
+
+  if (abs(config_threshold - recommend_threshold) > max_deviation_temp) {
+    PrintOut(LOG_WARNING,
+             "The %s temperature alarm threshold [%d] of the device %s differs greatly from the temperature threshold "
+             "defined by the manufacturer [%d] .You are advised to check the configuration again.\n ",
+             temp_level, config_threshold, device_name, recommend_threshold);
+  }
+  return;
+}
+
+void ATACheckTemperatureThreshold(const ata_smart_thresholds_pvt &smartthres, const char *device_name,
+                                  unsigned char &temp_info_threshold, unsigned char &temp_crit_threshold)
+{
+  unsigned char temp_threshold = 0;
+  bool ret = ata_get_temperature_threshold(smartthres, temp_threshold);
+  if (!ret) {
+    PrintOut(LOG_WARNING,
+             "Failed to obtain the temperature threshold defined by the manufacturer of the ATA device %s.\n",
+             device_name);
+    return;
+  }
+
+  // Estimate a relatively low infomal temperature threshold based on the critical temperature threshold.
+  unsigned char info_guess_threshold = temp_threshold * default_temperature_level_ratio;
+
+  CheckTemperatureConfig(info_guess_threshold, "informal", device_name, temp_info_threshold);
+  CheckTemperatureConfig(temp_threshold, "critical", device_name, temp_crit_threshold);
+  return;
+}
+
 // TODO: Add '-F swapid' directive
 const bool fix_swapped_id = false;
 
@@ -2152,11 +2196,16 @@ static int ATADeviceScan(dev_config & cfg, dev_state & state, ata_device * atade
               "Offline_Uncorrectable"))
       cfg.offl_pending_id = 0;
 
-    if (   (cfg.tempdiff || cfg.tempinfo || cfg.tempcrit)
-        && !ata_return_temperature_value(&state.smartval, cfg.attribute_defs)) {
-      PrintOut(LOG_INFO, "Device: %s, can't monitor Temperature, ignoring -W %d,%d,%d\n",
-               name, cfg.tempdiff, cfg.tempinfo, cfg.tempcrit);
-      cfg.tempdiff = cfg.tempinfo = cfg.tempcrit = 0;
+    if (cfg.tempdiff || cfg.tempinfo || cfg.tempcrit) {
+	  if (!ata_return_temperature_value(&state.smartval, cfg.attribute_defs)) {
+        PrintOut(LOG_INFO,
+                 "Device: %s, can't monitor Temperature, ignoring -W %d,%d,%d\n",
+                 name, cfg.tempdiff, cfg.tempinfo, cfg.tempcrit);
+        cfg.tempdiff = cfg.tempinfo = cfg.tempcrit = 0;
+      } 
+      else {
+        ATACheckTemperatureThreshold(state.smartthres, name, cfg.tempinfo, cfg.tempcrit);
+      }
     }
 
     // Report ignored '-r' or '-R' directives
@@ -2395,6 +2444,24 @@ static int ATADeviceScan(dev_config & cfg, dev_state & state, ata_device * atade
   return 0;
 }
 
+void SCSIGetTemperatureThreshold(const uint8_t trip_temp, const char *device_name, unsigned char &temp_info_threshold,
+                                 unsigned char &temp_crit_threshold)
+{
+  if (!trip_temp) {
+    PrintOut(LOG_WARNING,
+             "Failed to obtain the temperature threshold defined by the manufacturer of the SCSI device %s.\n", device_name);
+    return;
+  }
+
+  // According to the power-off temperature, it is estimated that the critical temperature and informal temperature are lower.
+  unsigned char critic_guess_threshold = trip_temp * default_temperature_level_ratio;
+  unsigned char info_guess_threshold = critic_guess_threshold * default_temperature_level_ratio;
+
+  CheckTemperatureConfig(info_guess_threshold, "informal", device_name, temp_info_threshold);
+  CheckTemperatureConfig(critic_guess_threshold, "critical", device_name, temp_crit_threshold);
+  return;
+}
+
 // on success, return 0. On failure, return >0.  Never return <0,
 // please.
 static int SCSIDeviceScan(dev_config & cfg, dev_state & state, scsi_device * scsidev,
@@ -2586,11 +2653,16 @@ static int SCSIDeviceScan(dev_config & cfg, dev_state & state, scsi_device * scs
       PrintOut(LOG_INFO, "Device: %s, unexpectedly failed to read SMART values\n", device);
       state.SuppressReport = 1;
     }
-    if (   (state.SuppressReport || !currenttemp)
-        && (cfg.tempdiff || cfg.tempinfo || cfg.tempcrit)) {
-      PrintOut(LOG_INFO, "Device: %s, can't monitor Temperature, ignoring -W %d,%d,%d\n",
-               device, cfg.tempdiff, cfg.tempinfo, cfg.tempcrit);
-      cfg.tempdiff = cfg.tempinfo = cfg.tempcrit = 0;
+    if (cfg.tempdiff || cfg.tempinfo || cfg.tempcrit) {
+      if (state.SuppressReport || !currenttemp) {
+        PrintOut(LOG_INFO,
+                 "Device: %s, can't monitor Temperature, ignoring -W %d,%d,%d\n",
+                 device, cfg.tempdiff, cfg.tempinfo, cfg.tempcrit);
+        cfg.tempdiff = cfg.tempinfo = cfg.tempcrit = 0;
+      } 
+      else {
+        SCSIGetTemperatureThreshold(triptemp, device, cfg.tempinfo, cfg.tempcrit);
+      }
     }
   }
   
@@ -2751,6 +2823,45 @@ static bool check_nvme_error_log(const dev_config & cfg, dev_state & state, nvme
   return true;
 }
 
+static int KelvinToCelsius(int kel_val)
+{
+  // Convert Kelvin to positive Celsius
+  const int kel_cel_diff = 273;
+  int cel_value = kel_val - kel_cel_diff;
+  if (cel_value < 1) {
+    cel_value = 1;
+  } 
+  else if (cel_value > 0xff) {
+    cel_value = 0xff;
+  }
+  return cel_value;
+}
+
+static void NvmeGetTemperatureThreshold(const nvme_id_ctrl &id_ctrl, const char *device_name,
+                                        unsigned char &temp_info_threshold, unsigned char &temp_crit_threshold)
+{
+  if (id_ctrl.wctemp) {
+    int cel_warning_temp = KelvinToCelsius(id_ctrl.wctemp);
+    CheckTemperatureConfig(cel_warning_temp, "informal", device_name, temp_info_threshold);
+  } 
+  else {
+    PrintOut(LOG_WARNING,
+             "Failed to obtain the informal temperature threshold defined by the manufacturer of the NVME device %s.\n ",
+             device_name);
+  }
+
+  if (id_ctrl.cctemp) {
+    int cel_critic_temp = KelvinToCelsius(id_ctrl.cctemp);
+    CheckTemperatureConfig(cel_critic_temp, "critical", device_name, temp_crit_threshold);
+  } 
+  else {
+    PrintOut(LOG_WARNING,
+             "Failed to obtain the critical temperature threshold defined by the manufacturer of the NVME device %s.\n ",
+             device_name);
+  }
+  return;
+}
+
 static int NVMeDeviceScan(dev_config & cfg, dev_state & state, nvme_device * nvmedev,
                           const dev_config_vector * prev_cfgs)
 {
@@ -2808,6 +2919,9 @@ static int NVMeDeviceScan(dev_config & cfg, dev_state & state, nvme_device * nvm
       PrintOut(LOG_INFO, "Device: %s, no Temperature sensors, ignoring -W %d,%d,%d\n",
                name, cfg.tempdiff, cfg.tempinfo, cfg.tempcrit);
       cfg.tempdiff = cfg.tempinfo = cfg.tempcrit = 0;
+    } 
+    else {
+      NvmeGetTemperatureThreshold(id_ctrl, name, cfg.tempinfo, cfg.tempcrit);
     }
   }
 

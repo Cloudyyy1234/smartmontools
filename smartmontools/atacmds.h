@@ -941,6 +941,9 @@ int ata_find_attr_index(unsigned char id, const ata_smart_values & smartval);
 // non-default interpretations. If the Attribute does not exist, return 0
 unsigned char ata_return_temperature_value(const ata_smart_values * data, const ata_vendor_attr_defs & defs);
 
+// Get Temperature Attribute threshold selected according to possible
+// non-default interpretations. If the Attribute does not exist, return false
+bool ata_get_temperature_threshold(const ata_smart_thresholds_pvt &smartthres, unsigned char &temp_threshold);
 
 #define MAX_ATTRIBUTE_NUM 256
 

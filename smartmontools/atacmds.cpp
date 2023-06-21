@@ -2183,6 +2183,23 @@ unsigned char ata_return_temperature_value(const ata_smart_values * data, const 
   return 0;
 }
 
+bool ata_get_temperature_threshold(const ata_smart_thresholds_pvt &smartthres, unsigned char &temp_threshold)
+{
+  // Normally threshold is at same index as attribute
+  static const int array_len = 4;
+  // Commonly used IDs for ATA device temperature attributes
+  static const unsigned char ids[array_len] = {194, 190, 9, 220};
+
+  for (int i = 0; i < NUMBER_ATA_SMART_ATTRIBUTES; i++) {
+    for (int j = 0; j < array_len; j++) {
+      if (smartthres.thres_entries[i].id == ids[j]) {
+        temp_threshold = smartthres.thres_entries[i].threshold;
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // Read SCT Status
 int ataReadSCTStatus(ata_device * device, ata_sct_status_response * sts)
